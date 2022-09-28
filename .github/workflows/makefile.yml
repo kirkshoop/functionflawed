@@ -1,0 +1,29 @@
+name: Makefile CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Install xetex
+      run: sudo apt-get install texlive-xetex
+
+    - uses: actions/checkout@v3
+      with:
+        submodules: 'recursive'
+
+    - name: Build paper
+      run: make
+
+    - name: Upload generated paper
+      uses: actions/upload-artifact@v3
+      with:
+        name: generated
+        path: generated/*
