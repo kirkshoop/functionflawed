@@ -6,8 +6,8 @@ date: today
 audience:
   - "LEWG Library Evolution"
 author:
-  - name: Doe
-    email: <john@doe.name>
+  - name: Kirk Shoop
+    email: <kirk.shoop@gmail.com>
 toc: true
 ---
 
@@ -16,9 +16,13 @@ Introduction
 
 ~~The common definition of function, across nearly all languages, for nearly all-time, is not composable due to asymmetry.~~
 
-Yeah, that is my customary approach - say something that causes such a visceral reaction that everything that follows is immediately dismissed. Story of my life. This paper is the outcome of several years of trying to find a general pattern for asynchronous composition. I tried threads and mutexes. I tried atomics. I tried fibers. I tried callbacks. I wrote rxcpp v1. I wrote rxcpp v2, I wrote pushmi. I moved to Lewis Baker's implementation of Sender/Receiver, libunifex. I learned a lot from Lewis Baker on how to structure async lifetimes and how coroutines in C++ map from the existing function definition. I convinced Lewis Baker that the C++ coroutines were limited in ways that Sender/Receiver were not. Lewis Baker started defining coroutines v2. C++20 shipped coroutines v1.
+Yeah, that is my customary approach - say something that causes a strong visceral reaction, such that everything that follows is immediately dismissed. Stick around for the meat. 
+
+This paper is the outcome of several years of trying to find a general pattern for asynchronous composition. I tried threads and mutexes. I tried atomics. I tried fibers. I tried raw-callback-functions. I wrote rxcpp v1. I wrote rxcpp v2, I wrote pushmi to introduce Sender/Receiver. I moved to Lewis Baker's implementation of Sender/Receiver, called libunifex. I learned a lot from Lewis Baker on how to structure async lifetimes and how coroutines in C++ map from the existing function definition. I convinced Lewis Baker that the C++ coroutines were limited in ways that Sender/Receiver were not. Lewis Baker started defining coroutines v2. C++20 shipped coroutines v1.
 
 So here we are.
+
+[exceptions, global state, global lock](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p2544r0.html)
 
 ## Asymmetry of Arity
 
@@ -46,7 +50,7 @@ Compose `inc_each()`.
 int four, two = inc_each(inc_each(2, 0));
 ```
 
-"Thats not valid c++!", "If c++ had a language tuple, this would be easy!", "Other languages have a language tuple to solve this!", "Use library `std::tuple<>` to demonstrate composablity!"
+"Thats not valid c++!", "If c++ had a language tuple, this would be easy!", "Other languages have a language tuple to solve this!", "Use library `std::tuple<>` to demonstrate composability!"
 
 ```cpp
 std::tuple<int, int> inc_each(int v0, int v1) {return std::make_tuple(inc(v0), inc(v1));}
@@ -107,7 +111,6 @@ std::tuple<int, int> fortyTwo = inc_each(inc_each(std::make_tuple(2, 0)));
 > Q: If allowing only a single argument is the answer for function composablity, why do we allow more than one argument to a function?
 
 "Perfect! Forcing a single argument would be symmetric! We can always compose the single argument out of sum and product types!"
-
 
 > Q: Have you compared the code gen for tuple to function argument passing lately?
 
@@ -209,7 +212,7 @@ aorb ab(aorb v) {
 aorb a = ab(ab(aorb{A{}}));
 ```
 
-"Perfect!", "That's ugly!", "No! Not all `std::variant<A, B>` are argument packs, implicitly converting a `variant<A, B>` to an argument pack is a bug!"
+"Perfect!", "That's ugly!", "No! Not all instances of `std::variant<A, B>` represent argument packs, implicitly converting a `variant<A, B>` to an argument pack is a bug!"
 
 > Q: Have you compared the code gen for variant to function argument passing lately?
 
@@ -265,7 +268,7 @@ void thenplus_set_value(An&&... an) {
 }
 ```
 
-Well, besides the need to support forward_set_value having overloads, thenplus also has to ensure that the given function does call forward_set_value. not to do so is a bug.
+Well, besides the need to support forward_set_value having overloads, `thenplus` also has to ensure that the given function does call forward_set_value. not to do so is a bug.
 
 ```cpp
 template<class... An>
@@ -289,18 +292,90 @@ void thenplus_set_value(An&&... an) {
 }
 ```
 
-Now, is this what we mean when we say function composition? 
+> Q: Is `then()` the only algorithm affected by the asymmetry?
 
-I hope not.
+No, many other algorithms are impacted: `sync_wait()`, `when_all()`, `upon_error`, `upon_stopped`, `stopped_as_optional`, and `stopped_as_error` come to mind initially. 
 
 ## what asymmetries remain?
 
 The ones that we want to be asymmetric. 
 
-A function result has a representation for error and we want that to be asymmetric. We want an error result to be used to return from the function not have it forwarded to another nested function call.
+A function result has a representation for error and we want that to be asymmetric. We want to return an error result from the function and not have the error value forwarded to another nested function call. We want to skip any other nested function call when an error result occurs.
+
+A function result has a representation for stop and we want that to be asymmetric. We want to return a stop result from the function and not have the stop result forwarded to another nested function call. We want to skip any other nested function call when a stop result occurs.
+
+One suggestion made to me was to use `expected<>` as an input argument to every function to improve composition.
+
+There are two options for how that might look shown below:
+
+> Note: Think about how common it will be to pass the wrong expected along. 
+
+> Note: Think about all the extra function calls and branches and copies of the error value on the error-path. 
+
+1. Use the preceding expected exactly and transform it into the new `expected<>` when it contains an error.
+
+```
+template<class R, class Unrelated, class... Tn>
+expected<R> make(expected<Unrelated> exp, Tn&&... ) {
+  if (exp.has_error()) { return {move(exp)}; }
+  /// ... produce R from Tn... or fail.
+}
+
+template<class Unrelated>
+void function(expected<Unrelated> exp) {
+  auto nam = make<myname>(exp, "name");
+  auto addr = make<myaddress>(nam, "street", "state", "zip");
+  auto eml = make<myemail>(addr, "email");
+  auto client = make<myclient>(eml, nam, addr, eml);
+  // ... etc..
+}
+```
+
+> Note: Think about the `Unrelated` value passed into every function and what it means for reasoning about the inputs to the function.
+
+This option does not improve composability. functions have multiple arguments and only one result.
+
+2. Transform preceding expected into a new `expected<>` that has all the arguments.
+
+```
+template<class R, class Ignored, class... Tn>
+expected<tuple<Tn...>> args_from(expected<Ignored> exp, Tn&&... tn) {
+  if (exp.has_error()) { return {move(exp)}; }
+  return tuple<Tn...>{(Tn&&)tn...};
+}
+
+template<class... Rn, class... Tn>
+expected<tuple<Rn>> make(expected<tuple<Tn...>> tn) {
+  if (tn.has_error()) { return {move(tn)}; }
+  /// ... produce tuple<Rn...> from tuple<Tn...> or fail.
+}
+
+void function(expected<tuple<>> void_arg) {
+  auto nam = make<myname>(args_from(void_arg, "name"));
+  auto addr = make<myaddress>(args_from(nam, "street", "state", "zip"));
+  auto eml = make<myemail>(args_from(addr, "email"));
+  auto client = make<myclient>(args_from(eml, nam, addr, eml));
+  // ... etc..
+}
+```
+
+Now we have symmetry! It is a good thing that I did not type out all the tuple unpacking..
+
+> Note: Now there are two branches per function call. `args_from()` adds the second.
+
+> Note: The success path does a lot of round-trips into and out of tuples and also round-trip tuples into and out of expecteds.
+
+## function composition?
+
+Is this what we want when we compose functions? 
+
+I hope not. I certainly do not want these limitations on function composition.
+
 
 Proposal
 ========
 
+There is a way out.
 
+[functions that return multiple values, errors, and can stop](https://godbolt.org/z/5cnd43Ts6)
 
